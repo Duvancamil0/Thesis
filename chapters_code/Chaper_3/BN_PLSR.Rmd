@@ -1,0 +1,431 @@
+---
+title: "Mineros BN"
+output: html_notebook
+---
+
+First let us create the BN structure that we will be using
+```{r}
+library(bnlearn)
+library(Rgraphviz)
+library(gRain)
+library(ggplot2)
+library(readxl)
+library(gridExtra)
+library(jtools)
+library(Metrics)
+
+initial_data <- read_csv("/Data.csv")
+
+initial_data$Number_of_Risks <- rowSums(initial_data[, c("Labor_Risk", "Analysis_Risk", "Decision_Risk", "Engineering_Risk", "Provider_Risk", "Weather_Risk", "Fabrication_Risk")])
+```
+
+Adjust the data
+```{r}
+levels_schedbud = c("Small", "Medium", "Large")
+
+initial_data$Budget_category <- factor(initial_data$Budget_category, levels=levels_schedbud)
+initial_data$Type <- factor(initial_data$Type)
+
+boolvar_names <- c('Labor_Risk', 'Analysis_Risk', 'Decision_Risk', 'Engineering_Risk', 'Provider_Risk', 'Weather_Risk', 'Fabrication_Risk', "Change_Control")
+
+for (var in boolvar_names) {
+  initial_data[[var]] <- as.factor(initial_data[[var]])
+}
+
+set.seed(1)
+initial_data <- initial_data[sample(nrow(initial_data)), ]
+
+summary(initial_data)
+```
+
+Exploratory data analysis
+
+
+```{r}
+regressions <- lm(Time_Overrun ~ ., initial_data[,-c(1,4,5,6,13,14,15)])
+summ(regressions)
+
+```
+
+```{r}
+t1 <- plot_summs(regressions)+
+  labs(title = "3.d", y = element_blank()) + 
+  theme_apa() + theme(plot.title = element_text(hjust = 0.5, face = "plain"))
+
+initial_data$Number_of_Risks <- as.factor(initial_data$Number_of_Risks)
+p1 <- ggplot(initial_data, aes(x=Number_of_Risks, y=Time_Overrun)) +
+  geom_boxplot(color= "light blue", outlier.colour = "red", outlier.shape = 1) + theme_minimal()+
+  labs(
+    title = "3.c",
+    x = element_blank(),
+    y = element_blank()
+  ) + theme(plot.title = element_text(hjust = 0.5))
+
+p2 <- ggplot(initial_data, aes(x = Change_Control, y = Time_Overrun)) +
+  stat_summary(fun = mean, geom = "bar", fill = "light blue") + theme_minimal()+
+  labs(
+    title = "3.b",
+    x = element_blank(),
+    y = element_blank()
+  ) + scale_y_continuous(expand = expansion(mult = c(0.05, 0.4))) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p3 <- ggplot(initial_data, aes(x = Schedule, y = Time_Overrun)) +
+  geom_point(color = "light blue") + theme_minimal() +
+  labs(
+    title = "3.a",
+    x = element_blank(),
+    y = element_blank()
+  ) + theme(plot.title = element_text(hjust = 0.5))
+
+grid.arrange(p3, p2, p1, t1)
+```
+
+Data preparation
+```{r}
+projects <- initial_data %>% select(-c("Change_Control", "Added_Time","Number_of_Risks"))
+projects <- projects[!(projects$ID %in% c(182, 183)), ]
+projects <- as.data.frame(projects)
+row.names(projects) <- projects$ID
+projects <- projects %>% select(-c("ID"))
+```
+
+
+Create the network
+```{r}
+create_model = empty.graph(c("Schedule", "Time_Overrun", "Type",
+                             "Budget_category",
+                             "Fabrication_Risk", "Weather_Risk",
+                             "Provider_Risk", "Engineering_Risk", "Decision_Risk",
+                             "Analysis_Risk", "Labor_Risk"))
+
+arc.set = matrix(c(
+                   "Type", "Fabrication_Risk",
+                   "Type", "Provider_Risk",
+                   "Type", "Decision_Risk",
+                   "Analysis_Risk", "Decision_Risk",
+                   "Decision_Risk", "Labor_Risk",
+                   "Decision_Risk", "Engineering_Risk",
+                   "Budget_category", "Provider_Risk",
+                   "Labor_Risk", "Provider_Risk",
+                   "Provider_Risk", "Fabrication_Risk",
+                   "Schedule", "Time_Overrun",
+                   "Engineering_Risk", "Time_Overrun",
+                   "Fabrication_Risk", "Time_Overrun",
+                   "Weather_Risk", "Time_Overrun",
+                   "Decision_Risk", "Time_Overrun",
+                   "Provider_Risk", "Time_Overrun",
+                   "Analysis_Risk", "Time_Overrun"
+),
+ncol = 2, byrow = TRUE,
+dimnames = list(NULL, c("from", "to")))
+
+arcs(create_model) = arc.set
+graphviz.plot(create_model, shape = "ellipse")
+```
+
+
+Cross-validation
+```{r}
+# Define a function for cross-validation
+cross_validate_bn <- function(data, bn_structure, k_folds = 10, target_node) {
+  # Create folds
+  set.seed(1)
+  folds <- cut(seq(1, nrow(data)), breaks = k_folds, labels = FALSE)
+  
+  # Initialize an empty list to store predictions
+  predictions <- vector("list", k_folds)
+  actual_values <- vector("list", k_folds)
+  
+  # Perform k-fold cross-validation
+  for(i in 1:k_folds) {
+    # Split data into training and testing sets
+    test_indices <- which(folds == i, arr.ind = TRUE)
+    test_data <- data[test_indices, ]
+    train_data <- data[-test_indices, ]
+    
+    # Fit the BN to the training set
+    fitted_bn <- bn.fit(bn_structure, data = train_data, method = "mle-cg")
+    
+    # Predict the target node in the test set
+    predicted_means <- numeric(nrow(test_data))
+    for (j in 1:nrow(test_data)) {
+      # Extract the values for the current row and convert them to a named list
+      evidence_list <- as.list(test_data[j, ])
+      
+      # Remove the target node from the evidence list
+      evidence_list <- list(
+        Fabrication_Risk = test_data[j, "Fabrication_Risk"],
+        Provider_Risk = test_data[j, "Provider_Risk"],
+        Decision_Risk = test_data[j, "Decision_Risk"],
+        Engineering_Risk = test_data[j, "Engineering_Risk"],
+        Analysis_Risk = test_data[j, "Analysis_Risk"],
+        Weather_Risk = test_data[j, "Weather_Risk"],
+        Schedule = test_data[j, "Schedule"])
+      
+      simul <- try(cpdist(fitted_bn, nodes = target_node, 
+                      evidence = evidence_list,
+                      method = "lw", n = 10^6), silent = TRUE)
+      # Check for errors during simulation
+      if (inherits(simul, "try-error")) {
+        predicted_means[j] <- NA  # Assign NA
+      } else {
+        # Extract the mean from the simulation results and store it
+        predicted_means[j] <- summary(simul[[target_node]])["Mean"]
+        predicted_means[j] <- min(max(predicted_means[j], 0), 1)
+      }
+    }
+    predictions[[i]] <- predicted_means
+    actual_values[[i]] <- test_data$Time_Overrun
+  }
+    # Combine all predictions into a single vector
+  all_predictions <- unlist(predictions)
+  all_actual_values <- unlist(actual_values)
+  
+  return(list(predictions = all_predictions, actual_values = all_actual_values))
+}
+
+results <- cross_validate_bn(projects, create_model, k_folds = 10, target_node = "Time_Overrun")
+
+# Combine predictions and actual values into single vectors
+all_predictions <- unlist(results$predictions)
+all_actual_values <- unlist(results$actual_values)
+
+# Calculate RMSE, excluding NAs
+non_na_indices <- !is.na(all_predictions) & !is.na(all_actual_values)
+rmse <- sqrt(mean((all_predictions[non_na_indices] - all_actual_values[non_na_indices])^2))
+rmse
+```
+
+RMSE of the company
+```{r}
+overrun_results <- initial_data[,c(1,3,14)]
+overrun_results <- overrun_results[!(overrun_results$ID %in% c(182, 183)), ]
+overrun_results$prediction <- all_predictions
+rmse(overrun_results$Time_Overrun, overrun_results$Added_Time)
+```
+
+
+# PLS
+
+```{r}
+set.seed(1)
+library(pls)
+Overall_risk_pls <- plsr(Time_Overrun ~ ., ncomp = 7, data = projects[,c(2,5:11)], validation = "LOO")
+summary(Overall_risk_pls)
+```
+
+The validation results here are Root Mean Squared Error of Prediction (RMSEP)
+```{r}
+error_plot <- RMSEP(Overall_risk_pls)
+error_plot <- as.data.frame(error_plot)
+error_plot <- error_plot[error_plot$estimate == "CV",]
+error_plot <- error_plot[, c("comps","value")]
+
+error_plot_plot <- ggplot(error_plot, aes(x = comps, y = value)) + 
+  geom_line() + # Add a line
+  geom_point() + # Add points
+  theme_minimal() + # Use a minimal theme for a clean look
+  labs(x = "Number of components", y = "RMSEP", title = "Error at different levels of alpha") + # Label axes and add a title
+  theme(plot.title = element_text(hjust = 0.5), # Center the title
+        text = element_text(size = 12), # Adjust text size
+        axis.title = element_text(size = 14)) # Adjust axis title size
+
+print(error_plot_plot)
+```
+
+Take the first component and use it to predict the overrun
+```{r}
+Overall_risk_pls$coefficients
+```
+
+```{r}
+plot(Overall_risk_pls$scores[,1],projects$Time_Overrun)
+```
+
+
+```{r}
+create_model_2 = empty.graph(c("Schedule", "Time_Overrun", "Type",
+                             "Budget_category", "Overall_Risk",
+                             "Fabrication_Risk", "Weather_Risk",
+                             "Provider_Risk", "Engineering_Risk", "Decision_Risk",
+                             "Analysis_Risk", "Labor_Risk"))
+
+arc.set_2 = matrix(c(
+                   "Type", "Fabrication_Risk",
+                   "Type", "Provider_Risk",
+                   "Type", "Decision_Risk",
+                   "Analysis_Risk", "Decision_Risk",
+                   "Decision_Risk", "Labor_Risk",
+                   "Decision_Risk", "Engineering_Risk",
+                   "Budget_category", "Provider_Risk",
+                   "Labor_Risk", "Provider_Risk",
+                   "Provider_Risk", "Fabrication_Risk",
+                   "Schedule", "Time_Overrun",
+                   "Labor_Risk", "Overall_Risk",
+                   "Engineering_Risk", "Overall_Risk",
+                   "Fabrication_Risk", "Overall_Risk",
+                   "Weather_Risk", "Overall_Risk",
+                   "Decision_Risk", "Overall_Risk",
+                   "Provider_Risk", "Overall_Risk",
+                   "Analysis_Risk", "Overall_Risk",
+                   "Overall_Risk", "Time_Overrun"
+),
+ncol = 2, byrow = TRUE,
+dimnames = list(NULL, c("from", "to")))
+
+arcs(create_model_2) = arc.set_2
+graphviz.plot(create_model_2, shape = "ellipse")
+
+```
+
+Cross-validate the results to check if they are producing better results
+```{r}
+# Define a function for cross-validation
+cross_validate_bn_plsr <- function(data, bn_structure, k_folds = 10, target_node) {
+  # Create folds
+  set.seed(1)
+  folds <- cut(seq(1, nrow(data)), breaks = k_folds, labels = FALSE)
+  
+  # Initialize an empty list to store predictions
+  predictions <- vector("list", k_folds)
+  scores <- vector("list", k_folds)
+  actual_values <- vector("list", k_folds)
+  
+  # Perform k-fold cross-validation
+  for(i in 1:k_folds) {
+    # Split data into training and testing sets
+    test_indices <- which(folds == i, arr.ind = TRUE)
+    test_data <- data[test_indices, ]
+    train_data <- data[-test_indices, ]
+    
+    # Perform PLSR on the training set to obtain the 'Overall_Risk' component
+    pls_model <- plsr(Time_Overrun ~ ., ncomp = 1, data = train_data[, c(2, 5:11)])
+    train_data$Overall_Risk <- pls_model$scores[,1]
+    
+    # Add the 'Overall_Risk' component to the test set
+    test_data$Overall_Risk <- predict(pls_model, type = "scores", 
+                                      newdata = test_data[, c(2, 5:11)], ncomp = 1)
+    scores[[i]] <- test_data$Overall_Risk
+    
+    # Fit the BN to the training set
+    fitted_bn <- bn.fit(bn_structure, data = train_data, method = "mle-cg")
+    
+    # Predict the target node in the test set
+    predicted_means <- numeric(nrow(test_data))
+    for (j in 1:nrow(test_data)) {
+      # Extract the values for the current row and convert them to a named list
+      evidence_list <- list(Overall_Risk = test_data[j, "Overall_Risk"], Schedule = test_data[j, "Schedule"])
+      
+      # Remove the target node from the evidence list
+      evidence_list[target_node] <- NULL
+      
+      simul <- try(cpdist(fitted_bn, nodes = target_node, 
+                      evidence = evidence_list,
+                      method = "lw", n = 10^6), silent = TRUE)
+      # Check for errors during simulation
+      if (inherits(simul, "try-error")) {
+        predicted_means[j] <- NA  # Assign NA
+      } else {
+        # Extract the mean from the simulation results and store it
+        predicted_means[j] <- summary(simul[[target_node]])["Mean"]
+        predicted_means[j] <- min(max(predicted_means[j], 0), 1)
+      }
+    }
+    predictions[[i]] <- predicted_means
+    actual_values[[i]] <- test_data$Time_Overrun
+  }
+    # Combine all predictions into a single vector
+  all_predictions <- unlist(predictions)
+  all_scores <- unlist(scores)
+  all_actual_values <- unlist(actual_values)
+  
+  return(list(predictions = all_predictions, scores = all_scores, actual_values = all_actual_values))
+}
+
+results_plsr <- cross_validate_bn_plsr(projects, create_model_2, k_folds = 10, target_node = "Time_Overrun")
+
+# Combine predictions and actual values into single vectors
+all_predictions_plsr <- unlist(results_plsr$predictions)
+all_actual_values_plsr <- unlist(results_plsr$actual_values)
+
+# Calculate RMSE, excluding NAs
+non_na_indices <- !is.na(all_predictions_plsr) & !is.na(all_actual_values_plsr)
+rmse <- sqrt(mean((all_predictions_plsr[non_na_indices] - all_actual_values_plsr[non_na_indices])^2))
+rmse
+```
+
+Check the NAs
+```{r}
+overrun_results$predictions_pslr <- results_plsr$predictions
+na_count_per_variable <- colSums(is.na(overrun_results))
+print(na_count_per_variable, quote = FALSE)
+```
+
+
+Fit the BN
+```{r}
+projects_or <- projects
+projects_or$Overall_Risk <- Overall_risk_pls$scores[,1]
+
+model_fit_pslr <- bn.fit(create_model_2, data = projects_or)
+
+simul_risks_pslr <- cpdist(model_fit_pslr, 
+                 nodes = c(       "Analysis_Risk", 
+                                  "Decision_Risk", 
+                                  "Engineering_Risk", 
+                                  "Provider_Risk",
+                                  "Fabrication_Risk",
+                                  "Labor_Risk"
+                 ),
+                 
+                 evidence = list(  Type = "Sustainment",
+                                   Schedule = 0.150523560,
+                                   Budget_category = "Medium"
+                                   #Weather_Risk=
+                                   #Analysis_Risk =  
+                                   #Decision_Risk = , 
+                                   #Engineering_Risk = 
+                                   #Provider_Risk="1"
+                                   #Fabrication_Risk="1",
+                                   #Labor_Risk="1"
+                 ), 
+                 method = "lw", n = 10^6)
+
+summary(simul_risks_pslr)
+```
+
+Instantiate one well-connected risk
+```{r}
+projects_or <- projects
+projects_or$Overall_Risk <- Overall_risk_pls$scores[,1]
+
+model_fit_pslr <- bn.fit(create_model_2, data = projects_or)
+
+simul_risks_pslr <- cpdist(model_fit_pslr, 
+                 nodes = c(       "Analysis_Risk", 
+                                  "Decision_Risk", 
+                                  "Engineering_Risk", 
+                                  "Provider_Risk",
+                                  "Fabrication_Risk",
+                                  "Labor_Risk"
+                 ),
+                 
+                 evidence = list(  Type = "Sustainment",
+                                   Schedule = 0.150523560,
+                                   Budget_category = "Medium",
+                                   #Weather_Risk=
+                                   #Analysis_Risk =  
+                                   Decision_Risk = "1"
+                                   #Engineering_Risk = 
+                                   #Provider_Risk="1"
+                                   #Fabrication_Risk="1",
+                                   #Labor_Risk="1"
+                 ), 
+                 method = "lw", n = 10^6)
+
+summary(simul_risks_pslr)
+```
+
+Not much change in the risk probabilities...
+

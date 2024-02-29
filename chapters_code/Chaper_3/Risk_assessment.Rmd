@@ -1,0 +1,194 @@
+---
+title: "PLS"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+
+## Load required libraries
+```{r}
+library(bnlearn)
+library(Rgraphviz)
+library(ggplot2)
+library(dplyr)
+library(readxl)
+library(caret)
+library(psych)
+library(Metrics)
+library(reticulate)
+library(pls)
+
+```
+
+# Prepare the data
+
+
+## Import the data (not available for the tentative thesis)
+```{r}
+total_data <- read_excel(path = "分析用データ.xlsx", sheet = "Analysis")
+
+overrun_data <- total_data$工数比
+
+# Detect outliers
+IQR_value <- IQR(overrun_data)
+Q1 <- quantile(overrun_data, 0.25)
+Q3 <- quantile(overrun_data, 0.75)
+
+# Define the cutoff points (1.5 times the IQR from the Q1 and Q3)
+lower_bound <- Q1 - 1.5 * IQR_value
+upper_bound <- Q3 + 1.5 * IQR_value
+
+outliers <- overrun_data < lower_bound | overrun_data > upper_bound
+
+# Remove the outliers from the data
+cleaned_overrun_data <- overrun_data[!outliers]
+total_data <- total_data[!outliers, ]
+
+# Imput missing risk assessments
+empty_fun <- function(risk) {
+  risk_2 = if_else(is.na(risk), 1, risk)
+  return(risk_2)
+}
+
+risks <- as.data.frame(total_data[,3:61])
+
+all_data <- as.data.frame(sapply(risks, empty_fun))
+all_data$overrun <- cleaned_overrun_data
+```
+
+# PLS
+
+```{r}
+set.seed(1)
+risks1 <- plsr(overrun~ ., ncomp = 59, data = all_data, validation = "LOO")
+summary(risks1)
+```
+
+The validation results here are Root Mean Squared Error of Prediction (RMSEP)
+```{r}
+error_plot <- RMSEP(risks1)
+error_plot <- as.data.frame(error_plot)
+error_plot <- error_plot[error_plot$estimate == "CV",]
+error_plot <- error_plot[, c("comps","value")]
+
+error_plot_plot <- ggplot(error_plot, aes(x = comps, y = value)) + 
+  geom_line() + # Add a line
+  geom_point() + # Add points
+  theme_minimal() + # Use a minimal theme for a clean look
+  labs(x = "Number of components", y = "RMSEP", title = "Error at different levels of alpha") + # Label axes and add a title
+  theme(plot.title = element_text(hjust = 0.5), # Center the title
+        text = element_text(size = 12), # Adjust text size
+        axis.title = element_text(size = 14)) # Adjust axis title size
+
+print(error_plot_plot)
+```
+
+## Compare the results of the pls to other methods
+### Autoencoder
+```{r}
+results_train <- all_data
+results_train$encoded1 <- risks1$scores[,1]
+results_train$encoded2 <- risks1$scores[,2]
+
+pls_risk_lr <- lm(overrun ~ encoded1 + encoded2 , data = results_train)
+summary(pls_risk_lr)
+```
+
+### Scores
+```{r}
+set.seed(1)
+risks2 <- plsr(overrun ~ ., ncomp = 2, data = all_data)
+```
+
+Understanding the most important factors
+```{r}
+coef(risks2, intercept = TRUE)
+```
+
+Plotting these encoded values vs the overrun
+```{r}
+# Plot 1: overrun vs encoded1
+plot(risks2$scores[,1], results_train$overrun, xlab = "First component", ylab = "Time overrun", main = "First Latent Variable")
+```
+
+```{r}
+
+# Plot 2: overrun vs encoded2
+plot(risks2$scores[,2], results_train$overrun, xlab = "Second component", ylab = "Time overrun", main = "Second Latent Variable")
+
+```
+
+Overall project risk
+```{r}
+scores <- as.data.frame(risks2$scores[,1])
+scores$second <- risks2$scores[,2]
+colnames(scores) <- c("Comp.1","Comp.2")
+scores$overrun <- results_train$overrun
+
+# Add a new column to categorize the overrun
+scores$overrun_category <- ifelse(scores$overrun > 1.2, "Overrun", "Normal")
+
+# Calculate the median values for the components
+median_comp1 <- median(scores$Comp.1)
+median_comp2 <- median(scores$Comp.2)
+
+ggplot(scores, aes(x = Comp.1, y = Comp.2, color = overrun_category)) +
+  geom_point(alpha = 0.6) +  # Use geom_point for scatter plot with some transparency
+  scale_color_manual(values = c("Normal" = "grey", "Overrun" = "red")) +  # Set colors
+  geom_vline(xintercept = median_comp1, linetype = "dashed", color = "grey") +  # Vertical line
+  geom_hline(yintercept = median_comp2, linetype = "dashed", color = "grey") +  # Horizontal line
+  labs(x = "Latent Variable 1", y = "Latent Variable 2", color = "Time Overrun Category", 
+       title = "Overall Project Risk vs Time Overrun") +
+  theme_minimal() +
+  theme(text = element_text(size = 12),
+        plot.title = element_text(hjust = 0.5))
+```
+
+Summary of the values
+```{r}
+# Categorize the components based on their median values
+scores$category <- with(scores, ifelse(Comp.1 < median_comp1 & Comp.2 < median_comp2, "Low-Low",
+                                       ifelse(Comp.1 >= median_comp1 & Comp.2 < median_comp2, "High-Low",
+                                              ifelse(Comp.1 < median_comp1 & Comp.2 >= median_comp2, "Low-High",
+                                                     "High-High"))))
+
+# Create a summary table of high overrun projects by category
+summary_table <- table(scores$category, scores$overrun_category)
+
+# Convert the table to a data frame for better display and analysis
+summary_df <- as.data.frame(summary_table)
+
+# Rename the columns for clarity
+names(summary_df) <- c("Component_Category", "Overrun_Category", "Count")
+
+# Calculate the total number of projects in each component category
+total_projects_per_category <- aggregate(Count ~ Component_Category, data = summary_df, FUN = sum)
+
+# Merge the total counts back into the summary data frame
+summary_df <- merge(summary_df, total_projects_per_category, by = "Component_Category", all.x = TRUE)
+
+# Rename the new column for total counts
+names(summary_df)[names(summary_df) == "Count.y"] <- "Total_Count"
+
+# Calculate the proportion of high overrun projects in each category
+summary_df$Proportion <- summary_df$Count / summary_df$Total_Count
+
+# Filter the summary data frame to only include the high overrun category
+high_overrun_df <- subset(summary_df, Overrun_Category == "Overrun")
+
+# Order the data frame by the proportion of high overrun
+high_overrun_df <- high_overrun_df[order(-high_overrun_df$Proportion), ]
+
+# Display the ordered data frame
+print(high_overrun_df)
+```
+
+
+Calculate the means
+```{r}
+means_vector <- colMeans(all_data, na.rm = TRUE)
+means <- data.frame(means_vector)
+```
+
