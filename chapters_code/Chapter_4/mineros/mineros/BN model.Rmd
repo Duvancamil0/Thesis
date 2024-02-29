@@ -1,0 +1,336 @@
+---
+title: "Mineros BN"
+output: html_notebook
+---
+
+First let us create the BN structure that we will be using
+```{r}
+library(bnlearn)
+library(Rgraphviz)
+
+
+create_model = empty.graph(c("Schedule_category", "Time_Overrun_category",
+                             "Budget_category", "Type",
+                             "Fabrication_Risk", "Weather_Risk",
+                             "Provider_Risk", "Engineering_Risk", "Decision_Risk",
+                             "Analysis_Risk", "Labor_Risk"))
+
+arc.set = matrix(c(
+                   "Type", "Fabrication_Risk",
+                   "Type", "Provider_Risk",
+                   "Type", "Decision_Risk",
+                   "Analysis_Risk", "Decision_Risk",
+                   "Decision_Risk", "Labor_Risk",
+                   "Decision_Risk", "Engineering_Risk",
+                   "Budget_category", "Provider_Risk",
+                   "Labor_Risk", "Provider_Risk",
+                   "Provider_Risk", "Fabrication_Risk",
+                   "Schedule_category", "Time_Overrun_category",
+                   "Engineering_Risk", "Time_Overrun_category",
+                   "Fabrication_Risk", "Time_Overrun_category",
+                   "Weather_Risk", "Time_Overrun_category",
+                   "Decision_Risk", "Time_Overrun_category",
+                   "Provider_Risk", "Time_Overrun_category",
+                   "Analysis_Risk", "Time_Overrun_category"
+),
+ncol = 2, byrow = TRUE,
+dimnames = list(NULL, c("from", "to")))
+
+arcs(create_model) = arc.set
+graphviz.plot(create_model, shape = "ellipse")
+
+```
+
+Then we can load the real data, learn the BN parameters from it and cross-validate the prediction power for the Overrun node using the discretized variables by the hartemink method.
+
+```{r}
+library(dplyr)
+initial_data <- read.csv("/Users/camilodavid/Library/CloudStorage/OneDrive-Personal/Tohoku U/PhD/Papers/4rd Paper/Code/Seed1/mineros/AI sampling/Data.csv")
+
+projects <- initial_data %>% select(-c("Change_Control", "Added_Time"))
+
+projects <- projects[!(projects$ID %in% c(182, 183)), ]
+row.names(projects) <- projects$ID
+projects <- projects %>% select(-c("ID"))
+projects <- as.data.frame(projects)
+
+levels_risk = c("0", "1")
+levels_cost = c("Small", "Medium", "Large")
+levels_type = c("Growth", "Sustainment", "Cost")
+
+projects$Budget_category <- factor(projects$Budget_category, levels=levels_cost, ordered=TRUE)
+projects$Type <- factor(projects$Type)
+
+
+boolvar_names <- c('Labor_Risk', 'Analysis_Risk', 'Decision_Risk', 'Engineering_Risk', 'Provider_Risk', 'Weather_Risk', 'Fabrication_Risk')
+
+for (var in boolvar_names) {
+  projects[[var]] <- as.factor(projects[[var]])
+}
+
+dprojects <- discretize(projects, method = "hartemink", breaks = 3, 
+                        ibreaks = 10, idisc = "quantile")
+#dprojects$Time_Overrun <- projects[["Time_Overrun"]]
+#dprojects <- discretize(dprojects, method = "hartemink", breaks = 4, 
+#                        ibreaks = 10, idisc = "quantile")
+
+levels_time = c("[0,0.16]", "(0.16,0.26]", "(0.26,1]")
+levels_overrun = c("[0,0.12]", "(0.12,0.43]", "(0.43,1]")
+
+projects$Schedule_category <- dprojects$Schedule
+projects$Time_Overrun_category <- dprojects$Time_Overrun
+projects$Schedule_category <- factor(projects$Schedule_category, levels=levels_time, ordered=TRUE)
+projects$Time_Overrun_category <- factor(projects$Time_Overrun_category, levels=levels_overrun, ordered=TRUE)
+
+projects <- projects %>% select(-c("Schedule", "Time_Overrun"))
+
+# Save the dataset so that we can create the augmented dataset
+write.csv(projects, "/Users/camilodavid/Library/CloudStorage/OneDrive-Personal/Tohoku U/PhD/Papers/4rd Paper/Code/Seed1/mineros/AI sampling/discrete.csv", row.names=FALSE)
+
+set.seed(1)
+projects <- projects[sample(nrow(projects)), ]
+
+summary(projects)
+```
+
+```{r}
+library(caret)
+# Define a function for cross-validation
+cross_validate_bn <- function(data, bn_structure, k_folds = 10, target_node) {
+  # Create folds
+  set.seed(1)
+  folds <- cut(seq(1, nrow(data)), breaks = k_folds, labels = FALSE)
+  
+  # Initialize an empty list to store predictions
+  predictions <- vector("list", k_folds)
+  actual_values <- vector("list", k_folds)
+  
+  # Perform k-fold cross-validation
+  for(i in 1:k_folds) {
+    # Split data into training and testing sets
+    test_indices <- which(folds == i, arr.ind = TRUE)
+    test_data <- data[test_indices, ]
+    train_data <- data[-test_indices, ]
+    
+    # Save the datasets so that we can create the augmented datasets
+    write.csv(test_data, paste0("/Users/camilodavid/Library/CloudStorage/OneDrive-Personal/Tohoku U/PhD/Papers/4rd Paper/Code/Seed1/mineros/AI sampling/Folds/test_data", i, ".csv"), row.names=FALSE)
+    write.csv(train_data, paste0("/Users/camilodavid/Library/CloudStorage/OneDrive-Personal/Tohoku U/PhD/Papers/4rd Paper/Code/Seed1/mineros/AI sampling/Folds/train_data", i, ".csv"), row.names=FALSE)
+    # Fit the BN to the training set
+    fitted_bn <- bn.fit(bn_structure, data = train_data, method = "bayes")
+    
+    # Predict the target node in the test set
+    predicted <- predict(fitted_bn, node = target_node, 
+                         data = test_data, method = "bayes-lw", n = 10^7)
+    predictions[[i]] <- predicted
+    actual_values[[i]] <- test_data$Time_Overrun_category
+    
+  }
+    # Combine all predictions into a single vector
+  all_predictions <- unlist(predictions)
+  all_actual_values <- unlist(actual_values)
+  
+  return(list(predictions = all_predictions, actual_values = all_actual_values))
+}
+
+n_folds = 10
+
+results <- cross_validate_bn(projects, create_model, 
+                             k_folds = n_folds, target_node = "Time_Overrun_category")
+
+# Combine predictions and actual values into single vectors
+all_predictions <- unlist(results$predictions)
+all_actual_values <- unlist(results$actual_values)
+
+# Calculate RMSE, excluding NAs
+confusionMatrix(all_predictions, all_actual_values)
+```
+
+Then we perform the same cross-validation but using an augmented dataset for each of the folds.
+```{r}
+predictions_aug <- vector("list", n_folds)
+actual_values_aug <- vector("list", n_folds)
+  
+for(i in 1:n_folds) {
+  
+  aug_data <- read.csv(paste0("/Users/camilodavid/Library/CloudStorage/OneDrive-Personal/Tohoku U/PhD/Papers/4rd Paper/Code/Seed1/mineros/AI sampling/Augmentation/augmented_data", i, ".csv"))
+  test_data <- read.csv(paste0("/Users/camilodavid/Library/CloudStorage/OneDrive-Personal/Tohoku U/PhD/Papers/4rd Paper/Code/Seed1/mineros/AI sampling/Folds/test_data", i, ".csv"))
+
+  aug_data$Budget_category <- factor(aug_data$Budget_category, levels=levels_cost, ordered=TRUE)
+  aug_data$Schedule_category <- factor(aug_data$Schedule_category, levels=levels_time, ordered=TRUE)
+  aug_data$Time_Overrun_category <- factor(aug_data$Time_Overrun_category, levels=levels_overrun, ordered=TRUE)
+  aug_data$Type <- factor(aug_data$Type, levels = levels_type)
+
+  boolvar_names <- c('Labor_Risk', 'Analysis_Risk', 'Decision_Risk', 'Engineering_Risk', 'Provider_Risk', 'Weather_Risk', 'Fabrication_Risk')
+
+  for (var in boolvar_names) {
+  aug_data[[var]] <- factor(aug_data[[var]], levels = levels_risk)
+  }
+  
+  test_data$Budget_category <- factor(test_data$Budget_category, levels=levels_cost, ordered=TRUE)
+  test_data$Schedule_category <- factor(test_data$Schedule_category, levels=levels_time, ordered=TRUE)
+  test_data$Time_Overrun_category <- factor(test_data$Time_Overrun_category, levels=levels_overrun, ordered=TRUE)
+  test_data$Type <- factor(test_data$Type, levels = levels_type)
+
+  for (var in boolvar_names) {
+  test_data[[var]] <- factor(test_data[[var]], levels = levels_risk)
+  }
+  
+  # Fit the BN to the training set
+  fitted_bn_aug <- bn.fit(create_model, data = aug_data, method = "bayes")
+    
+    # Predict the target node in the test set
+  predicted_aug <- predict(fitted_bn_aug, node = "Time_Overrun_category", 
+                           data = test_data, method = "bayes-lw", n = 10^7)
+  predictions_aug[[i]] <- predicted_aug
+  actual_values_aug[[i]] <- test_data$Time_Overrun_category
+}
+
+all_predictions_aug <- unlist(predictions_aug)
+all_actual_values_aug <- unlist(actual_values_aug)
+confusionMatrix(all_predictions_aug, all_actual_values_aug)
+```
+
+Having seen that the data augmentation is not hurting but helping us with the parameter learning, we can fit a model using the 81 projects and see how that can help us improve our decision making by making use of conditional sampling.
+We will use the same projects we have used in chapter 2 and 3, so we need to find out what is the situation regarding the relevant data we have for those two projects and see what queries we need to make to improve the situation. Projects 182 and 183 share the same configurations regarding the categories of the budget, schedule and type.
+
+```{r}
+num_rows <- projects %>%
+  filter(Budget_category == 'Medium',
+         Schedule_category == '[0,0.16]',
+         Type == 'Sustainment') %>%
+  tally()
+num_rows
+```
+
+```{r}
+filtered_data <- subset(projects, Budget_category == 'Medium' & 
+                            Schedule_category == '[0,0.16]' & 
+                            Type == 'Sustainment')
+
+risk_tables <- lapply(boolvar_names, function(var) {
+  table(filtered_data[[var]], useNA = "ifany")
+})
+risk_tables
+```
+
+```{r}
+overrun_table <- table(filtered_data$Time_Overrun_category, useNA = "ifany")
+overrun_table
+```
+
+```{r}
+full_table <- with(filtered_data, table(Labor_Risk, Analysis_Risk, Decision_Risk, Engineering_Risk,
+                                        Provider_Risk, Weather_Risk, Fabrication_Risk,
+                                        Time_Overrun_category, useNA = "ifany"))
+
+num_zero_count_cells <- sum(full_table == 0)
+num_zero_count_cells
+```
+
+We see that number of datapoints is very small. First let us do the inference in the BN with the projets dataset
+```{r}
+model_real <- bn.fit(create_model, data = projects, method = "bayes")
+  
+simul <- cpdist(model_real, nodes ="Time_Overrun_category", 
+                evidence = list(
+                  Analysis_Risk = "0",
+                  Decision_Risk = "0",
+                  Engineering_Risk = "0",
+                  Provider_Risk= "1",
+                  Weather_Risk= "0",
+                  Fabrication_Risk= "0",
+                  Labor_Risk= "0",
+                  Schedule_category = "[0,0.16]"
+                ),
+                method = "lw", n = 10^6)
+
+predicted_overrun <- summary(simul$Time_Overrun)
+category_with_highest_count <- names(predicted_overrun)[which.max(predicted_overrun)]
+predicted_overrun
+```
+
+Let us check the risks
+```{r}
+simul2 <- cpdist(model_real, 
+                 nodes = c(       
+                                  "Labor_Risk", 
+                                  "Analysis_Risk", 
+                                  "Decision_Risk", 
+                                  "Engineering_Risk", 
+                                  "Provider_Risk",
+                                  "Fabrication_Risk"
+                 ),
+                 
+                 evidence = list(  
+                                  Schedule_category = "[0,0.16]",
+                                  Budget_category = "Medium",
+                                  Type = "Sustainment"
+                                  #Provider_Risk = "1"
+                                   
+                 ), 
+                 method = "lw", n = 10^6)
+summary(simul2)
+```
+
+
+```{r}
+conditional_data <- read.csv("/Users/camilodavid/Library/CloudStorage/OneDrive-Personal/Tohoku U/PhD/Papers/4rd Paper/Code/Seed1/mineros/AI sampling/conditional_data.csv")
+
+augmented_data <- rbind(projects, conditional_data)
+
+augmented_data$Budget_category <- factor(augmented_data$Budget_category, levels=levels_cost, ordered=TRUE)
+  augmented_data$Schedule_category <- factor(augmented_data$Schedule_category, levels=levels_time, ordered=TRUE)
+  augmented_data$Time_Overrun_category <- factor(augmented_data$Time_Overrun_category, levels=levels_overrun, ordered=TRUE)
+  augmented_data$Type <- factor(augmented_data$Type, levels = levels_type)
+
+  boolvar_names <- c('Labor_Risk', 'Analysis_Risk', 'Decision_Risk', 'Engineering_Risk', 'Provider_Risk', 'Weather_Risk', 'Fabrication_Risk')
+
+  for (var in boolvar_names) {
+  augmented_data[[var]] <- factor(augmented_data[[var]], levels = levels_risk)
+  }
+
+model_augmented <- bn.fit(create_model, data = augmented_data, method = "mle")
+```
+
+```{r}
+simul <- cpdist(model_augmented, nodes ="Time_Overrun_category", 
+                evidence = list(
+                  Analysis_Risk = "0",
+                  Decision_Risk = "0",
+                  Engineering_Risk = "0",
+                  Provider_Risk= "1",
+                  Weather_Risk= "0",
+                  Fabrication_Risk= "0",
+                  Labor_Risk= "0",
+                  Schedule_category = "[0,0.16]"
+                ),
+                method = "lw", n = 10^6)
+
+predicted_overrun <- summary(simul$Time_Overrun)
+category_with_highest_count <- names(predicted_overrun)[which.max(predicted_overrun)]
+predicted_overrun
+```
+
+```{r}
+simul3 <- cpdist(model_augmented, 
+                 nodes = c(       
+                                  "Labor_Risk", 
+                                  "Analysis_Risk", 
+                                  "Decision_Risk", 
+                                  "Engineering_Risk", 
+                                  "Provider_Risk",
+                                  "Fabrication_Risk"
+                 ),
+                 
+                 evidence = list(  
+                                  Schedule_category = "[0,0.16]",
+                                  Budget_category = "Medium",
+                                  Type = "Sustainment"
+                                  #Provider_Risk = "1"
+                                   
+                 ), 
+                 method = "lw", n = 10^6)
+summary(simul3)
+```
+
+
