@@ -19,7 +19,8 @@ In each Benchmark BN folder, you will find the following data and code:
   - Synthesized data files.
   - Python scripts (`CTGAN.py`, `TVAE.py`) for creating synthetic data using CTGAN and TVAE.
   - A JSON file with the metadata of the datasets to perform data synthetization.
-  - A folder names `Augmented`, which houses all the augmented datasets and Python scripts for calculating the similarities.
+
+- A folder named `Augmented`, which houses all the augmented datasets and Python scripts for calculating the similarities.
 
 ## Code
 All the code in this repository is written in Python and R, with a focus on clarity and simplicity.
